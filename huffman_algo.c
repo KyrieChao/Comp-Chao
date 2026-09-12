@@ -7,19 +7,19 @@
 //   内部：leaf = 0，c 没有意义，weight 是左右孩子权之和
 struct node {
     struct node *left, *right;
-    unsigned char c;
+    unsigned short c;
     int weight;
     int leaf;
 };
 
 // 森林：建树过程中「还没被合并的树」都排在这里
-Node* forest[MAX_CODE_LEN] = {0};
+Node* forest[ALPHABET_SIZE] = {0};
 
 // 森林里有几棵树。建树时一路减少，最后剩 1 棵，那就是根
 int count = 0;
 
 // 码表：code_tab[字节] = 这个字节的 '0'/'1' 串
-char code_tab[MAX_CODE_LEN][MAX_CODE_LEN];
+char code_tab[ALPHABET_SIZE][MAX_CODE_BITS];
 
 // 后序释放一棵树（先放孩子，再放自己）
 static void free_tree(Node* node) {
@@ -58,12 +58,12 @@ static void accumulate_wpl(Node* root, int* total_bits, int depth) {
 }
 
 // ==================== 频次统计 ====================
-int counter(const unsigned char* data, size_t len, unsigned int* freq) {
+int counter(const unsigned short* data, size_t len, unsigned int* freq) {
     int leaf_count = 0;
     for (size_t i = 0; i < len; i++) {
-        freq[(unsigned char)data[i]]++;
+        freq[(unsigned short)data[i]]++;
     }
-    for (size_t i = 0; i < MAX_CODE_LEN; i++) {
+    for (size_t i = 0; i < ALPHABET_SIZE; i++) {
         if (freq[i] > 0) leaf_count++;
     }
     return leaf_count;
@@ -72,7 +72,7 @@ int counter(const unsigned char* data, size_t len, unsigned int* freq) {
 // ==================== 建树 ====================
 int HuFF_Init(const unsigned int* freq, size_t len) {
     if (len <= 0) return 1; // 空输入，连叶子都没有
-    for (int i = 0; i < MAX_CODE_LEN; i++) {
+    for (int i = 0; i < ALPHABET_SIZE; i++) {
         if (freq[i] <= 0) continue; // 没出现过的字节不建叶子
         Node* node = malloc(sizeof(Node));
         if (!node) { // 半路没内存了，把已经建好的清掉
@@ -83,7 +83,7 @@ int HuFF_Init(const unsigned int* freq, size_t len) {
             count = 0;
             return -1;
         }
-        node->c = (unsigned char)i;
+        node->c = (unsigned short)i;
         node->weight = freq[i];
         node->leaf = 1;
         node->left = node->right = NULL;
@@ -142,11 +142,11 @@ void HuFF_Wpl(int* total_bits) {
 }
 
 void HuFF_Code_Table() {
-    unsigned char path[MAX_CODE_LEN] = {0};
+    unsigned char path[MAX_CODE_BITS] = {0};
     fill_code_tab(forest[0], 0, path);
 }
 
-void HuFF_Get(const unsigned char* data, unsigned char* out, size_t len) {
+void HuFF_Get(const unsigned short* data, unsigned char* out, size_t len) {
     for (size_t i = 0; i < len; i++) {
         size_t code_len = strlen(code_tab[data[i]]);
         memcpy(out, code_tab[data[i]], code_len);
@@ -155,7 +155,7 @@ void HuFF_Get(const unsigned char* data, unsigned char* out, size_t len) {
 }
 
 // ==================== 解码 ====================
-void HuFF_Decode(const unsigned char* bit_str, unsigned char* out, size_t len) {
+void HuFF_Decode(const unsigned char* bit_str, unsigned short* out, size_t len) {
     Node* root = forest[0];
     size_t bit_pos = 0;
     for (size_t i = 0; i < len; i++) {
@@ -178,7 +178,7 @@ void HuFF_Decode(const unsigned char* bit_str, unsigned char* out, size_t len) {
 //
 // 两个游标都用指针传，是为了让左右两棵子树共用同一个 ——
 // 左子树写完之后游标停在它末尾，右子树从那儿接着写，两边不会互相覆盖。
-static void dump_struct(Node* root, char* struct_out, int* pos, unsigned char* symbols, size_t* sym_pos) {
+static void dump_struct(Node* root, char* struct_out, int* pos, unsigned short* symbols, size_t* sym_pos) {
     if (root->leaf == 1) {
         struct_out[(*pos)++] = '0';
         symbols[(*sym_pos)++] = root->c;
@@ -189,7 +189,7 @@ static void dump_struct(Node* root, char* struct_out, int* pos, unsigned char* s
     dump_struct(root->right, struct_out, pos, symbols, sym_pos);
 }
 
-void HuFF_Struct(char* struct_out, int capacity, unsigned char* symbols) {
+void HuFF_Struct(char* struct_out, int capacity, unsigned short* symbols) {
     int pos = 0;
     size_t sym_pos = 0;
     dump_struct(forest[0], struct_out, &pos, symbols, &sym_pos);
@@ -197,7 +197,7 @@ void HuFF_Struct(char* struct_out, int capacity, unsigned char* symbols) {
 }
 
 // ==================== 从结构串重建树（解码端）====================
-static Node* rebuild(const unsigned char* struct_bits, size_t* bit_pos, const unsigned char* symbols, size_t* sym_pos) {
+static Node* rebuild(const unsigned char* struct_bits, size_t* bit_pos, const unsigned short* symbols, size_t* sym_pos) {
     unsigned char mark = struct_bits[(*bit_pos)++]; // 先吃掉当前这一位
 
     Node* node = malloc(sizeof(Node));
@@ -217,7 +217,7 @@ static Node* rebuild(const unsigned char* struct_bits, size_t* bit_pos, const un
     return node;
 }
 
-int HuFF_Rebuild(const unsigned char* struct_bits, const unsigned char* symbols) {
+int HuFF_Rebuild(const unsigned char* struct_bits, const unsigned short* symbols) {
     HuFF_Destroy();
 
     size_t bit_pos = 0; // 位游标：每读一位前进一格

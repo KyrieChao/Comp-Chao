@@ -3,16 +3,15 @@
 
 #include <stddef.h>
 
-// 一个字节最多 256 种取值，所以叶子最多 256 个；
-// 它同时也当「最长编码位数」用（树最坏退化成一条链时就是这个数）
-#define MAX_CODE_LEN 256
+#define ALPHABET_SIZE 513 // 符号有多少种取值
+#define MAX_CODE_BITS 256 // 码最长能有几位
 
 typedef struct node Node;
 
 // ---------------- 频次统计 ----------------
 // 数 data 里每个字节出现了多少次，结果写进 freq[256]（下标就是字节值）。
 // 返回值 = 出现过多少种不同字节，也就是叶子数。
-int counter(const unsigned char* data, size_t len, unsigned int* freq);
+int counter(const unsigned short* data, size_t len, unsigned int* freq);
 
 // ---------------- 建树（编码端）----------------
 // 按频次摆好一片森林：每个出现过的字节是一个叶子。
@@ -34,7 +33,7 @@ void HuFF_Code_Table();
 
 // 把 data 的每个字节换成码，依次拼成一条 '0'/'1' 串写进 out。
 // out 至少要能放 total_bits 个字符。
-void HuFF_Get(const unsigned char* data, unsigned char* out, size_t len);
+void HuFF_Get(const unsigned short* data, unsigned char* out, size_t len);
 
 // 把树的形状写成「结构串」：前序遍历，内部节点写 '1'，叶子写 '0'。
 //
@@ -45,15 +44,15 @@ void HuFF_Get(const unsigned char* data, unsigned char* out, size_t len);
 //
 // struct_out 至少要能放 2*叶子数 个字节（2*叶子数-1 个标记 + 结尾的 '\0'）。
 // symbols    至少要能放 叶子数 个字节。
-void HuFF_Struct(char* struct_out, int capacity, unsigned char* symbols);
+void HuFF_Struct(char* struct_out, int capacity, unsigned short* symbols);
 
 // ---------------- 解码（读端）----------------
 // 沿树走 bit_str 里的 '0'/'1'：'0' 走左、'1' 走右，
 // 每走到一个叶子就吐出一个字节，一共吐 len 个。
-void HuFF_Decode(const unsigned char* bit_str, unsigned char* out, size_t len);
+void HuFF_Decode(const unsigned char* bit_str, unsigned short* out, size_t len);
 
 // 从「结构串 + 符号表」把树重建出来。
 // 建完之后 forest[0] 是根、count = 1，后面的 Code_Table / Decode 可以直接用。
-int HuFF_Rebuild(const unsigned char* struct_bits, const unsigned char* symbols);
+int HuFF_Rebuild(const unsigned char* struct_bits, const unsigned short* symbols);
 
 #endif

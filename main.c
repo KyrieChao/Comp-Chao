@@ -1,9 +1,10 @@
 #include "huffman_algo.h"
+#include "lz77.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
-#define MAX_STRUCT_STR (2 * MAX_CODE_LEN)
+#define MAX_STRUCT_STR (2 * ALPHABET_SIZE)
 #define MAX_STRUCT_BYTES ((MAX_STRUCT_STR + 7) / 8)
 
 // 把 '0'/'1' 串压成字节。
@@ -24,9 +25,6 @@ int bit_to_byte(const unsigned char* bit_str, unsigned char* packed, size_t bit_
     return (int)byte_count;
 }
 
-// bit_to_byte 的逆操作：把字节摊回 '0'/'1'。
-// bit_count 是要摊多少「位」（不是字节数）。
-// 末尾会补 '\0'，所以 out 至少要 bit_count+1 个字节。
 int byte_to_bit(const unsigned char* packed, unsigned char* bit_str, int bit_count) {
     for (int i = 0; i < bit_count; i++) {
         int byte_pos = i / 8;
@@ -37,21 +35,17 @@ int byte_to_bit(const unsigned char* packed, unsigned char* bit_str, int bit_cou
     return bit_count;
 }
 
-// 格式：
-//   [data_len     : 4 字节] 原文件多少字节（解压时靠它知道要吐多少个字符）
-//   [leaf_count   : 4 字节] 叶子数 = 不同字节数 = 结构串里 '0' 的个数
-//   [struct_bytes : 4 字节] 结构串压完占几个字节
-//   [符号表   : leaf_count 字节]   按叶子被前序遍历访问到的顺序排列（不是按字节值排的！）
-//   [结构串   : struct_bytes 字节] 树的形状，已经压成字节
-//   [载荷     : 一直到文件尾]       原文编码后的码流
-int compress(const char* out_name, const unsigned char* data, int data_len) {
-    unsigned int freq[MAX_CODE_LEN] = {0};
-    int leaf_count = counter(data, (size_t)data_len, freq);
+int compress(const char* out_name,
+             const unsigned short* sym, int sym_n,
+             const unsigned short* dist, int dist_n,
+             int data_len) {
+    unsigned int freq[ALPHABET_SIZE] = {0};
+    int leaf_count = counter(sym, (size_t)sym_n, freq);
     // 空文件
     if (leaf_count == 0) return -1;
 
     // 建树，并算出每个字节的码
-    if (HuFF_Init(freq, (size_t)data_len) != 0) return -1;
+    if (HuFF_Init(freq, (size_t)sym_n) != 0) return -1;
     HuFF_Build();
     HuFF_Code_Table();
 
@@ -66,7 +60,7 @@ int compress(const char* out_name, const unsigned char* data, int data_len) {
     unsigned char* payload = malloc((size_t)payload_bytes + 1);
     char struct_str[MAX_STRUCT_STR];
     unsigned char struct_packed[MAX_STRUCT_BYTES];
-    unsigned char symbols[MAX_CODE_LEN]; // 符号表：顺序由 HuFF_Struct 一趟产出来
+    unsigned short symbols[ALPHABET_SIZE];
     if (!bit_str || !payload) {
         free(bit_str);
         free(payload);
@@ -79,7 +73,7 @@ int compress(const char* out_name, const unsigned char* data, int data_len) {
     bit_to_byte((unsigned char*)struct_str, struct_packed, (size_t)(2 * leaf_count - 1));
 
     // 原文 -> 码串 -> 载荷
-    HuFF_Get(data, bit_str, (size_t)data_len);
+    HuFF_Get(sym, bit_str, (size_t)sym_n);
     bit_to_byte(bit_str, payload, (size_t)total_bits);
 
     HuFF_Destroy();
@@ -94,12 +88,12 @@ int compress(const char* out_name, const unsigned char* data, int data_len) {
     fwrite(&data_len, sizeof(int), 1, fp);
     fwrite(&leaf_count, sizeof(int), 1, fp);
     fwrite(&struct_bytes, sizeof(int), 1, fp);
+    fwrite(&sym_n, sizeof(int), 1, fp);
+    fwrite(&dist_n, sizeof(int), 1, fp);
 
-    // 符号表：按「叶子被前序遍历访问到的顺序」，不是按字节值排的。
-    // 这个顺序必须和结构串里 '0' 出现的顺序一致，否则解压端挂叶子会错位。
-    fwrite(symbols, 1, (size_t)leaf_count, fp);
-
+    fwrite(symbols, 1, sizeof(unsigned short) * leaf_count, fp);
     fwrite(struct_packed, 1, (size_t)struct_bytes, fp);
+    fwrite(dist, sizeof(unsigned short), (size_t)dist_n, fp);
     fwrite(payload, 1, (size_t)payload_bytes, fp);
 
     long file_size = ftell(fp);
@@ -115,10 +109,12 @@ int decompress(const char* in_name, const char* out_name) {
     FILE* fp = fopen(in_name, "rb");
     if (!fp) return -1;
 
-    int data_len, leaf_count, struct_bytes;
+    int data_len, leaf_count, struct_bytes, sym_n, dist_n;
     if (fread(&data_len, sizeof(int), 1, fp) != 1 ||
         fread(&leaf_count, sizeof(int), 1, fp) != 1 ||
-        fread(&struct_bytes, sizeof(int), 1, fp) != 1) {
+        fread(&struct_bytes, sizeof(int), 1, fp) != 1 ||
+        fread(&sym_n, sizeof(int), 1, fp) != 1 ||
+        fread(&dist_n, sizeof(int), 1, fp) != 1) {
         fclose(fp);
         return -1;
     }
@@ -126,12 +122,10 @@ int decompress(const char* in_name, const char* out_name) {
     int struct_bits = 2 * leaf_count - 1; // 结构串有多少位
 
     // 1. 符号表：leaf_count 个单字节
-    unsigned char symbols[MAX_CODE_LEN] = {0};
-    for (int i = 0; i < leaf_count; i++) {
-        if (fread(&symbols[i], 1, 1, fp) != 1) {
-            fclose(fp);
-            return -1;
-        }
+    unsigned short symbols[ALPHABET_SIZE] = {0};
+    if (fread(symbols, sizeof(unsigned short), (size_t)leaf_count, fp) != (size_t)leaf_count) {
+        fclose(fp);
+        return -1;
     }
 
     // 2. 结构串：读 struct_bytes 个字节，摊成 struct_bits 个 '0'/'1'
@@ -152,7 +146,16 @@ int decompress(const char* in_name, const char* out_name) {
         fclose(fp);
         return -1;
     }
-
+    unsigned short* dist = malloc(dist_n * sizeof(unsigned short));
+    if (!dist) {
+        fclose(fp);
+        return 1;
+    }
+    if (fread(dist, sizeof(unsigned short), (size_t)dist_n, fp) != (size_t)dist_n) {
+        HuFF_Destroy();
+        fclose(fp);
+        return -1;
+    }
     // 4. 载荷 = 文件剩下的全部字节。
     //    载荷是文件的最后一段，所以直接拿 EOF 兜底，不必再存一个长度字段。
     long payload_start = ftell(fp);
@@ -162,8 +165,9 @@ int decompress(const char* in_name, const char* out_name) {
 
     unsigned char* payload = malloc((size_t)payload_bytes + 1);
     unsigned char* bit_str = malloc((size_t)payload_bytes * 8 + 1);
-    unsigned char* out_buf = malloc((size_t)data_len + 1);
-    if (!payload || !bit_str || !out_buf) {
+    unsigned char* final = malloc(((size_t)data_len + 1));
+    unsigned short* out_buf = malloc(((size_t)sym_n + 1) * sizeof(unsigned short));
+    if (!payload || !bit_str || !out_buf || !final) {
         free(payload);
         free(bit_str);
         free(out_buf);
@@ -186,7 +190,7 @@ int decompress(const char* in_name, const char* out_name) {
     //    载荷最后一个字节的低位可能带着补的 0，但 HuFF_Decode 只要凑够
     //    data_len 个字符就停，那些补出来的位不会被碰到。
     byte_to_bit(payload, bit_str, (int)payload_bytes * 8);
-    HuFF_Decode(bit_str, out_buf, (size_t)data_len);
+    HuFF_Decode(bit_str, out_buf, (size_t)sym_n);
     HuFF_Destroy();
 
     FILE* out = fopen(out_name, "wb");
@@ -196,12 +200,16 @@ int decompress(const char* in_name, const char* out_name) {
         free(out_buf);
         return -1;
     }
-    fwrite(out_buf, 1, (size_t)data_len, out);
+    long final_len = 0;
+    lz77_decode(out_buf, sym_n, dist, dist_n, final, &final_len);
+    fwrite(final, 1, (size_t)final_len, out);
     fclose(out);
 
     free(payload);
     free(bit_str);
     free(out_buf);
+    free(final);
+    free(dist);
     return 0;
 }
 
@@ -234,11 +242,11 @@ static void replace_ext(const char* path, const char* ext, char* out, size_t out
     if (base == 0) base = strlen(path);
     size_t ext_len = strlen(ext);
     if (base + ext_len + 1 > out_size) {
-        snprintf(out, out_size, "%s", path);        // 装不下就原样返回
+        snprintf(out, out_size, "%s", path); // 装不下就原样返回
         return;
     }
     memcpy(out, path, base);
-    memcpy(out + base, ext, ext_len + 1);           // 连结尾的 '\0' 一起拷
+    memcpy(out + base, ext, ext_len + 1); // 连结尾的 '\0' 一起拷
 }
 
 // 在扩展名前面插一段后缀："demo.txt" + "_5675" -> "demo_5675.txt"
@@ -308,23 +316,34 @@ int main(int argc, char* argv[]) {
         fseek(in, 0, SEEK_END);
         long size = ftell(in);
         fseek(in, 0, SEEK_SET);
-
-        unsigned char* data = malloc((size_t)size + 1);
-        if (!data) { fclose(in); return 1; }
-        if (size > 0 && fread(data, 1, (size_t)size, in) != (size_t)size) {
+        unsigned char* raw = malloc(size);
+        if (!raw) {
             fclose(in);
-            free(data);
+            return 1;
+        }
+        if (size > 0 && fread(raw, 1, (size_t)size, in) != (size_t)size) {
+            fclose(in);
+            free(raw);
             return 1;
         }
         fclose(in);
-
-        if (compress(out_name, data, (int)size) != 0) {
+        unsigned short* sym = malloc(size * sizeof(unsigned short));
+        unsigned short* dist = malloc(size * sizeof(unsigned short));
+        if (!sym || !dist) {
+            free(sym);
+            free(dist);
+            return 1;
+        }
+        int sn = 0, dn = 0;
+        lz77_encode(raw, size, sym, dist, &sn, &dn);
+        if (compress(out_name, sym, sn, dist, dn, (int)size) != 0) {
             printf("compress failed\n");
-            free(data);
             return 1;
         }
         printf("-> %s\n", out_name);
-        free(data);
+        free(sym);
+        free(dist);
+        free(raw);
 
     } else if (argv[1][0] == 'd') {
         // 输出名：给了就用给的（明确指定就照写，允许覆盖）；
