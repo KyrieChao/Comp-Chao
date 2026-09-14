@@ -1,3 +1,25 @@
+// main.c —— 命令行入口 + 文件读写 + 比特打包。
+//
+// 这里是「字节世界」和「符号世界」的边界：
+//   huffman_algo 只认符号（unsigned short），不知道字节是什么
+//   lz77 把字节流拆成 (符号流, 距离流)
+//   这个文件负责把两条流拼成 .chao 文件，再原样拆回来
+//
+// .chao 文件的布局（按写入顺序）：
+//
+//   [data_len     : 4]   原文件字节数
+//   [leaf_count   : 4]   哈夫曼叶子数
+//   [struct_bytes : 4]   结构串压完占几个字节
+//   [dist_bits    : 4]   每个距离占几位（所有距离等宽）
+//   [sym_n        : 4]   符号流有多少个符号
+//   [dist_n       : 4]   距离流有多少个距离
+//   [结构串       : struct_bytes]   前序遍历，内部 '1'、叶子 '0'，按位打包
+//   [符号表       : leaf_count * 2] 每个叶子一个 unsigned short，按叶子前序遍历顺序
+//   [距离段       : ceil(dist_n * dist_bits / 8)]  每个距离 dist_bits 位，按位打包
+//   [载荷         : 到文件尾]       符号流的哈夫曼码流，末字节补 0 对齐
+//
+// 载荷放最后，是为了它的长度能直接用 EOF - 当前位置 算出来，省掉一个长度字段。
+
 #include "huffman_algo.h"
 #include "lz77.h"
 #include <stdio.h>
@@ -25,6 +47,9 @@ int bit_to_byte(const unsigned char* bit_str, unsigned char* packed, size_t bit_
     return (int)byte_count;
 }
 
+// bit_to_byte 的逆操作：把 packed 摊回 bit_count 个 '0'/'1' 字符。
+// 从每个字节的最高位开始读，跟 bit_to_byte 的写入口径一致。
+// 末尾会补一个 '\0'，所以 bit_str 至少要能放 bit_count + 1 个字节。
 int byte_to_bit(const unsigned char* packed, unsigned char* bit_str, int bit_count) {
     for (int i = 0; i < bit_count; i++) {
         int byte_pos = i / 8;
@@ -35,6 +60,7 @@ int byte_to_bit(const unsigned char* packed, unsigned char* bit_str, int bit_cou
     return bit_count;
 }
 
+// 把 (符号流, 距离流) 编码成 .chao 文件。成功返回 0。
 int compress(const char* out_name,
              const unsigned short* sym, int sym_n,
              const unsigned short* dist, int dist_n,
@@ -52,12 +78,12 @@ int compress(const char* out_name,
     // 编码后的总位数，后面所有长度都从它推
     int total_bits = 0;
     HuFF_Wpl(&total_bits);
-    int payload_bytes = (total_bits + 7) / 8;
+    size_t payload_bytes = (total_bits + 7) / 8;
     int struct_bytes = (2 * leaf_count - 1 + 7) / 8;
 
     // 码串：一个字符一位，先在这儿拼好，再整块压成字节
     unsigned char* bit_str = malloc((size_t)total_bits + 1);
-    unsigned char* payload = malloc((size_t)payload_bytes + 1);
+    unsigned char* payload = malloc(payload_bytes + 1);
     char struct_str[MAX_STRUCT_STR];
     unsigned char struct_packed[MAX_STRUCT_BYTES];
     unsigned short symbols[ALPHABET_SIZE];
@@ -84,17 +110,61 @@ int compress(const char* out_name,
         free(payload);
         return -1;
     }
+    // ---- 距离段：所有距离统一按 dist_bits 位写 ----
+    // 每个距离原本固定 2 字节（16 位）。先算出「最大的那个距离需要几位」，
+    // 然后所有距离都按这么宽写。demo.txt 最大距离 7197，13 位就够，
+    // 每个距离省 3 位，814 个距离就是 300 多字节。
+    unsigned short dx = 0;
+    for (int i = 0; i < dist_n; i++) {
+        if (dist[i] > dx) dx = dist[i];
+    }
 
+    // dx 要几位二进制才装得下？每右移一位丢一个最低位，丢到只剩 1 为止。
+    // dx = 0 和 dx = 1 都停在 1 位，正好是我们要的下限（0 位没法表示任何数）。
+    unsigned short dx_2 = dx;
+    int dist_bits = 1;
+    while (dx_2 > 1) {
+        dist_bits += 1;
+        dx_2 >>= 1;
+    }
+
+    // 把每个距离摊成 dist_bits 个 '0'/'1'，从最高位开始写。
+    // 位串上的格子 = 第几个距离 * dist_bits + 这个距离的第几位。
+    size_t dist_str_size = dist_bits * dist_n;
+    unsigned char* dist_bit_str = malloc(dist_str_size + 1);
+    if (!dist_bit_str) {
+        free(bit_str);
+        free(payload);
+        return 1;
+    }
+    for (int i = 0; i < dist_n; i++) {
+        for (int j = 0; j < dist_bits; j++) {
+            dist_bit_str[i * dist_bits + j] = '0' + ((dist[i] >> (dist_bits - j - 1)) & 1);
+        }
+    }
+    dist_bit_str[dist_str_size] = '\0';
+    // 位 -> 字节，字节数 = ceil(位数 / 8)。
+    // 多要 1 个字节是为了 dist_n = 0 时也能拿到一块非 NULL 的内存
+    // （malloc(0) 返回什么由实现决定，可能是 NULL）。
+    unsigned char* dist_packed = malloc(1 + (dist_str_size + 7) / 8);
+    if (!dist_packed) {
+        free(bit_str);
+        free(payload);
+        free(dist_bit_str);
+        return 1;
+    }
+    int dist_packed_count = bit_to_byte((unsigned char*)dist_bit_str, dist_packed, dist_str_size);
     fwrite(&data_len, sizeof(int), 1, fp);
     fwrite(&leaf_count, sizeof(int), 1, fp);
     fwrite(&struct_bytes, sizeof(int), 1, fp);
+    fwrite(&dist_bits, sizeof(int), 1, fp);
     fwrite(&sym_n, sizeof(int), 1, fp);
     fwrite(&dist_n, sizeof(int), 1, fp);
 
-    fwrite(symbols, 1, sizeof(unsigned short) * leaf_count, fp);
     fwrite(struct_packed, 1, (size_t)struct_bytes, fp);
-    fwrite(dist, sizeof(unsigned short), (size_t)dist_n, fp);
-    fwrite(payload, 1, (size_t)payload_bytes, fp);
+    fwrite(symbols, 1, sizeof(unsigned short) * leaf_count, fp);
+    fwrite(dist_packed, 1, dist_packed_count, fp);
+    fwrite(payload, 1, payload_bytes, fp);
 
     long file_size = ftell(fp);
     printf("%d byte -> %ld byte (%.1f%%)\n", data_len, file_size, 100.0 * file_size / data_len);
@@ -102,17 +172,21 @@ int compress(const char* out_name,
     fclose(fp);
     free(bit_str);
     free(payload);
+    free(dist_packed);
+    free(dist_bit_str);
     return 0;
 }
 
+// 把 .chao 文件还原成原文件。成功返回 0。
 int decompress(const char* in_name, const char* out_name) {
     FILE* fp = fopen(in_name, "rb");
     if (!fp) return -1;
 
-    int data_len, leaf_count, struct_bytes, sym_n, dist_n;
+    int data_len, leaf_count, struct_bytes, sym_n, dist_n, dist_bits;
     if (fread(&data_len, sizeof(int), 1, fp) != 1 ||
         fread(&leaf_count, sizeof(int), 1, fp) != 1 ||
         fread(&struct_bytes, sizeof(int), 1, fp) != 1 ||
+        fread(&dist_bits, sizeof(int), 1, fp) != 1 ||
         fread(&sym_n, sizeof(int), 1, fp) != 1 ||
         fread(&dist_n, sizeof(int), 1, fp) != 1) {
         fclose(fp);
@@ -121,14 +195,6 @@ int decompress(const char* in_name, const char* out_name) {
 
     int struct_bits = 2 * leaf_count - 1; // 结构串有多少位
 
-    // 1. 符号表：leaf_count 个单字节
-    unsigned short symbols[ALPHABET_SIZE] = {0};
-    if (fread(symbols, sizeof(unsigned short), (size_t)leaf_count, fp) != (size_t)leaf_count) {
-        fclose(fp);
-        return -1;
-    }
-
-    // 2. 结构串：读 struct_bytes 个字节，摊成 struct_bits 个 '0'/'1'
     unsigned char struct_packed[MAX_STRUCT_BYTES] = {0};
     char struct_str[MAX_STRUCT_STR];
     for (int i = 0; i < struct_bytes; i++) {
@@ -137,24 +203,60 @@ int decompress(const char* in_name, const char* out_name) {
             return -1;
         }
     }
+
+    unsigned short symbols[ALPHABET_SIZE] = {0};
+    if (fread(symbols, sizeof(unsigned short), (size_t)leaf_count, fp) != (size_t)leaf_count) {
+        fclose(fp);
+        return -1;
+    }
+
     byte_to_bit(struct_packed, (unsigned char*)struct_str, struct_bits);
 
-    // 3. 重建树。
-    //    这里不调 HuFF_Code_Table（解码是沿树走，用不到码表），
-    //    也不调 HuFF_Wpl（总位数是靠频次算的，解码端没有频次）。
     if (HuFF_Rebuild((unsigned char*)struct_str, symbols) != 0) {
         fclose(fp);
         return -1;
     }
-    unsigned short* dist = malloc(dist_n * sizeof(unsigned short));
-    if (!dist) {
+    // ---- 距离段：读字节 -> 摊成位串 -> 每 dist_bits 位切一刀 ----
+    // 顺序不能颠倒：文件里存的是打包后的字节，得先读进来、再摊开、最后才切分。
+    size_t dist_str_size = dist_n * dist_bits;
+    unsigned char* dist_bit_str = malloc(dist_str_size + 1);
+    if (!dist_bit_str) {
+        free(dist_bit_str);
         fclose(fp);
         return 1;
     }
-    if (fread(dist, sizeof(unsigned short), (size_t)dist_n, fp) != (size_t)dist_n) {
+    size_t dist_packed_count = (dist_str_size + 7) / 8;
+    unsigned char* dist_packed = malloc(dist_packed_count + 1);
+    if (!dist_packed) {
+        free(dist_packed);
+        fclose(fp);
+        return 1;
+    }
+    if (fread(dist_packed, 1, dist_packed_count, fp) != dist_packed_count) {
         HuFF_Destroy();
+        free(dist_bit_str);
+        free(dist_packed);
         fclose(fp);
         return -1;
+    }
+    byte_to_bit(dist_packed, dist_bit_str, (int)dist_str_size);
+
+    unsigned short* dist = malloc(dist_n * sizeof(unsigned short));
+    if (!dist) {
+        HuFF_Destroy();
+        free(dist);
+        free(dist_bit_str);
+        free(dist_packed);
+        fclose(fp);
+        return -1;
+    }
+    // 每 dist_bits 位切一刀，拼回一个距离。
+    // 每读一位，先把手里的数左移一格腾出最低位，再把这一位塞进去。
+    for (int i = 0; i < dist_n; i++) {
+        dist[i] = 0;
+        for (int j = 0; j < dist_bits; j++) {
+            dist[i] = (dist[i] << 1) | (dist_bit_str[i * dist_bits + j] - '0');
+        }
     }
     // 4. 载荷 = 文件剩下的全部字节。
     //    载荷是文件的最后一段，所以直接拿 EOF 兜底，不必再存一个长度字段。
@@ -210,6 +312,8 @@ int decompress(const char* in_name, const char* out_name) {
     free(out_buf);
     free(final);
     free(dist);
+    free(dist_packed);
+    free(dist_bit_str);
     return 0;
 }
 

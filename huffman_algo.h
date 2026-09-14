@@ -9,7 +9,7 @@
 typedef struct node Node;
 
 // ---------------- 频次统计 ----------------
-// 数 data 里每个字节出现了多少次，结果写进 freq[256]（下标就是字节值）。
+// 数 data 里每个符号出现了多少次，结果写进 freq[]（下标就是符号值）。
 // 返回值 = 出现过多少种不同字节，也就是叶子数。
 int counter(const unsigned short* data, size_t len, unsigned int* freq);
 
@@ -43,7 +43,7 @@ void HuFF_Get(const unsigned short* data, unsigned char* out, size_t len);
 // 注意：它不是按字节值排的，两者不一定相同。
 //
 // struct_out 至少要能放 2*叶子数 个字节（2*叶子数-1 个标记 + 结尾的 '\0'）。
-// symbols    至少要能放 叶子数 个字节。
+// symbols    至少要能放 叶子数 个 unsigned short。
 void HuFF_Struct(char* struct_out, int capacity, unsigned short* symbols);
 
 // ---------------- 解码（读端）----------------
