@@ -10,12 +10,12 @@
 //   [data_len     : 4]   原文件字节数
 //   [leaf_count   : 4]   哈夫曼叶子数
 //   [struct_bytes : 4]   结构串压完占几个字节
-//   [dist_bits    : 4]   每个距离占几位（所有距离等宽）
+//   [dist_bytes   : 4]   距离段占几个字节
 //   [sym_n        : 4]   符号流有多少个符号
 //   [dist_n       : 4]   距离流有多少个距离
 //   [结构串       : struct_bytes]   前序遍历，内部 '1'、叶子 '0'，按位打包
 //   [符号表       : leaf_count * 2] 每个叶子一个 unsigned short，按叶子前序遍历顺序
-//   [距离段       : ceil(dist_n * dist_bits / 8)]  每个距离 dist_bits 位，按位打包
+//   [距离段       : dist_bytes]     每条 5 位档位号 + 若干 extra，按位打包
 //   [载荷         : 到文件尾]       符号流的哈夫曼码流，末字节补 0 对齐
 //
 // 载荷放最后，是为了它的长度能直接用 EOF - 当前位置 算出来，省掉一个长度字段。
@@ -29,6 +29,32 @@
 #define MAX_STRUCT_STR (2 * ALPHABET_SIZE)
 #define MAX_STRUCT_BYTES ((MAX_STRUCT_STR + 7) / 8)
 
+static const int d_base[30] = {1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769, 1025, 1537, 2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577};
+static const int d_extra[30] = {0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13};
+
+int dist_code(int n) {
+    if (n >= d_base[29]) return 29;
+    for (int i = 0; i < 29; i++) {
+        if ((d_base[i] <= n && n < d_base[i + 1])) return i;
+    }
+    return -1;
+}
+
+// 把 value 的低 n 位写进位串，高位在前，游标推进 n
+static void put_bits(unsigned char* bits, size_t* pos, unsigned int value, int n) {
+    for (int i = 0; i < n; i++) {
+        bits[(*pos)++] = '0' + ((value >> (n - i - 1)) & 1);
+    }
+    bits[*pos] = '\0';
+}
+// 从位串读 n 位，高位在前，游标推进 n
+static unsigned int get_bits(const unsigned char* bits, size_t* pos, int n) {
+    int number = 0;
+    for (int i = 0; i < n; i++) {
+        number = (number << 1) | (bits[((*pos)++)] - '0');
+    }
+    return number;
+}
 // 把 '0'/'1' 串压成字节。
 // bit_count 是位数，返回压出来的字节数 = ceil(bit_count/8)。
 // 最后一个字节不够 8 位时，低位用 0 补满。
@@ -104,65 +130,79 @@ int compress(const char* out_name,
 
     HuFF_Destroy();
 
+    // --- todo ---
+    unsigned int d_freq[ALPHABET_SIZE] = {0};
+    for (int i = 0; i < dist_n; i++) d_freq[dist_code(dist[i])]++;
+    if (HuFF_Init(d_freq, (size_t)dist_n) != 0) {
+        free(bit_str);
+        free(payload);
+        return -1;
+    }
+    HuFF_Build();
+    HuFF_Code_Table();
+    char d_struct_str[MAX_STRUCT_STR];
+    unsigned short d_symbols[ALPHABET_SIZE];
+    unsigned char d_struct_packed[MAX_STRUCT_BYTES];
+    HuFF_Struct(d_struct_str, MAX_STRUCT_STR, d_symbols);
+    int d_leaf_count = 0;
+    for (size_t i = 0; i < ALPHABET_SIZE; i++) {
+        if (d_freq[i] > 0) d_leaf_count++;
+    }
+    int d_struct_bytes = bit_to_byte((unsigned char*)d_struct_str, d_struct_packed, (size_t)(2 * d_leaf_count - 1));
+    // -----------
     FILE* fp = fopen(out_name, "wb");
     if (!fp) {
         free(bit_str);
         free(payload);
         return -1;
     }
-    // ---- 距离段：所有距离统一按 dist_bits 位写 ----
-    // 每个距离原本固定 2 字节（16 位）。先算出「最大的那个距离需要几位」，
-    // 然后所有距离都按这么宽写。demo.txt 最大距离 7197，13 位就够，
-    // 每个距离省 3 位，814 个距离就是 300 多字节。
-    unsigned short dx = 0;
+    // ---- 距离段：每条写 5 位档位号，后面跟若干位 extra ----
+    // 宽度随档位变（近的距离 extra 短），所以先算总位数，才知道位串开多大。
+    size_t dist_bit_count = 0;
     for (int i = 0; i < dist_n; i++) {
-        if (dist[i] > dx) dx = dist[i];
+        int k = dist_code(dist[i]);
+        dist_bit_count += strlen(HuFF_Code(k)) + d_extra[k];
     }
 
-    // dx 要几位二进制才装得下？每右移一位丢一个最低位，丢到只剩 1 为止。
-    // dx = 0 和 dx = 1 都停在 1 位，正好是我们要的下限（0 位没法表示任何数）。
-    unsigned short dx_2 = dx;
-    int dist_bits = 1;
-    while (dx_2 > 1) {
-        dist_bits += 1;
-        dx_2 >>= 1;
-    }
-
-    // 把每个距离摊成 dist_bits 个 '0'/'1'，从最高位开始写。
-    // 位串上的格子 = 第几个距离 * dist_bits + 这个距离的第几位。
-    size_t dist_str_size = dist_bits * dist_n;
-    unsigned char* dist_bit_str = malloc(dist_str_size + 1);
+    unsigned char* dist_bit_str = malloc(dist_bit_count + 1);
     if (!dist_bit_str) {
         free(bit_str);
         free(payload);
-        return 1;
+        fclose(fp);
+        return -1;
     }
+    size_t pos = 0;
     for (int i = 0; i < dist_n; i++) {
-        for (int j = 0; j < dist_bits; j++) {
-            dist_bit_str[i * dist_bits + j] = '0' + ((dist[i] >> (dist_bits - j - 1)) & 1);
-        }
+        int k = dist_code(dist[i]);
+        const char* code = HuFF_Code(k);
+        for (int j = 0; code[j]; j++) dist_bit_str[pos++] = (unsigned char)code[j];
+        put_bits(dist_bit_str, &pos, dist[i] - d_base[k], d_extra[k]);
     }
-    dist_bit_str[dist_str_size] = '\0';
-    // 位 -> 字节，字节数 = ceil(位数 / 8)。
-    // 多要 1 个字节是为了 dist_n = 0 时也能拿到一块非 NULL 的内存
-    // （malloc(0) 返回什么由实现决定，可能是 NULL）。
-    unsigned char* dist_packed = malloc(1 + (dist_str_size + 7) / 8);
+    HuFF_Destroy();
+
+    size_t dist_bytes = (dist_bit_count + 7) / 8;
+    unsigned char* dist_packed = malloc(1 + dist_bytes);
     if (!dist_packed) {
         free(bit_str);
         free(payload);
         free(dist_bit_str);
-        return 1;
+        fclose(fp);
+        return -1;
     }
-    int dist_packed_count = bit_to_byte((unsigned char*)dist_bit_str, dist_packed, dist_str_size);
+    int dist_packed_count = bit_to_byte((unsigned char*)dist_bit_str, dist_packed, dist_bit_count);
     fwrite(&data_len, sizeof(int), 1, fp);
     fwrite(&leaf_count, sizeof(int), 1, fp);
     fwrite(&struct_bytes, sizeof(int), 1, fp);
-    fwrite(&dist_bits, sizeof(int), 1, fp);
+    fwrite(&dist_bytes, sizeof(int), 1, fp);
     fwrite(&sym_n, sizeof(int), 1, fp);
     fwrite(&dist_n, sizeof(int), 1, fp);
+    fwrite(&d_leaf_count, sizeof(int), 1, fp);
+    fwrite(&d_struct_bytes, sizeof(int), 1, fp);
 
     fwrite(struct_packed, 1, (size_t)struct_bytes, fp);
     fwrite(symbols, 1, sizeof(unsigned short) * leaf_count, fp);
+    fwrite(d_struct_packed, 1, (size_t)d_struct_bytes, fp);
+    fwrite(d_symbols, 1, sizeof(unsigned short) * d_leaf_count, fp);
     fwrite(dist_packed, 1, dist_packed_count, fp);
     fwrite(payload, 1, payload_bytes, fp);
 
@@ -182,13 +222,15 @@ int decompress(const char* in_name, const char* out_name) {
     FILE* fp = fopen(in_name, "rb");
     if (!fp) return -1;
 
-    int data_len, leaf_count, struct_bytes, sym_n, dist_n, dist_bits;
+    int data_len, leaf_count, struct_bytes, sym_n, dist_n, dist_bytes, d_leaf_count, d_struct_bytes;
     if (fread(&data_len, sizeof(int), 1, fp) != 1 ||
         fread(&leaf_count, sizeof(int), 1, fp) != 1 ||
         fread(&struct_bytes, sizeof(int), 1, fp) != 1 ||
-        fread(&dist_bits, sizeof(int), 1, fp) != 1 ||
+        fread(&dist_bytes, sizeof(int), 1, fp) != 1 ||
         fread(&sym_n, sizeof(int), 1, fp) != 1 ||
-        fread(&dist_n, sizeof(int), 1, fp) != 1) {
+        fread(&dist_n, sizeof(int), 1, fp) != 1 ||
+        fread(&d_leaf_count, sizeof(int), 1, fp) != 1 ||
+        fread(&d_struct_bytes, sizeof(int), 1, fp) != 1) {
         fclose(fp);
         return -1;
     }
@@ -216,47 +258,38 @@ int decompress(const char* in_name, const char* out_name) {
         fclose(fp);
         return -1;
     }
-    // ---- 距离段：读字节 -> 摊成位串 -> 每 dist_bits 位切一刀 ----
-    // 顺序不能颠倒：文件里存的是打包后的字节，得先读进来、再摊开、最后才切分。
-    size_t dist_str_size = dist_n * dist_bits;
-    unsigned char* dist_bit_str = malloc(dist_str_size + 1);
+    unsigned char* dist_bit_str = malloc((size_t)dist_bytes * 8 + 1);
     if (!dist_bit_str) {
+        fclose(fp);
+        return -1;
+    }
+    unsigned char* dist_packed = malloc(dist_bytes + 1);
+    if (!dist_packed) {
         free(dist_bit_str);
         fclose(fp);
-        return 1;
+        return -1;
     }
-    size_t dist_packed_count = (dist_str_size + 7) / 8;
-    unsigned char* dist_packed = malloc(dist_packed_count + 1);
-    if (!dist_packed) {
-        free(dist_packed);
-        fclose(fp);
-        return 1;
-    }
-    if (fread(dist_packed, 1, dist_packed_count, fp) != dist_packed_count) {
+    if (fread(dist_packed, 1, (size_t)dist_bytes, fp) != (size_t)dist_bytes) {
         HuFF_Destroy();
         free(dist_bit_str);
         free(dist_packed);
         fclose(fp);
         return -1;
     }
-    byte_to_bit(dist_packed, dist_bit_str, (int)dist_str_size);
+    byte_to_bit(dist_packed, dist_bit_str, (int)((size_t)dist_bytes * 8));
 
     unsigned short* dist = malloc(dist_n * sizeof(unsigned short));
     if (!dist) {
         HuFF_Destroy();
-        free(dist);
         free(dist_bit_str);
         free(dist_packed);
         fclose(fp);
         return -1;
     }
-    // 每 dist_bits 位切一刀，拼回一个距离。
-    // 每读一位，先把手里的数左移一格腾出最低位，再把这一位塞进去。
+    size_t pos = 0;
     for (int i = 0; i < dist_n; i++) {
-        dist[i] = 0;
-        for (int j = 0; j < dist_bits; j++) {
-            dist[i] = (dist[i] << 1) | (dist_bit_str[i * dist_bits + j] - '0');
-        }
+        int k = get_bits(dist_bit_str, &pos, 5);
+        dist[i] = d_base[k] + get_bits(dist_bit_str, &pos, d_extra[k]);
     }
     // 4. 载荷 = 文件剩下的全部字节。
     //    载荷是文件的最后一段，所以直接拿 EOF 兜底，不必再存一个长度字段。

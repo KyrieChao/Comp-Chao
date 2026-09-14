@@ -153,21 +153,29 @@ void HuFF_Get(const unsigned short* data, unsigned char* out, size_t len) {
         out += code_len;
     }
 }
+// 取某个符号的码串（'0'/'1'）。没出现过的符号返回空串。
+const char* HuFF_Code(unsigned short sym) {
+    return code_tab[sym];
+}
 
 // ==================== 解码 ====================
+// 从位串里解出一个符号，游标推进它用掉的位数。
+unsigned short HuFF_Decode_One(const unsigned char* bit_str, size_t* pos) {
+    Node* p = forest[0];
+    while (!p->leaf) { // 还没落到叶子，就继续往下走
+        if (bit_str[*pos] == '0')
+            p = p->left;
+        else
+            p = p->right;
+        (*pos)++;
+    }
+    return p->c;
+}
+
 void HuFF_Decode(const unsigned char* bit_str, unsigned short* out, size_t len) {
-    Node* root = forest[0];
     size_t bit_pos = 0;
     for (size_t i = 0; i < len; i++) {
-        Node* p = root;
-        while (!p->leaf) { // 还没落到叶子，就继续往下走
-            if (bit_str[bit_pos] == '0')
-                p = p->left;
-            else
-                p = p->right;
-            bit_pos++;
-        }
-        *out++ = p->c; // 落到叶子，吐出一个字节
+        *out++ = HuFF_Decode_One(bit_str, &bit_pos); // 落到叶子，吐出一个字节
     }
 }
 

@@ -35,6 +35,9 @@ void HuFF_Code_Table();
 // out 至少要能放 total_bits 个字符。
 void HuFF_Get(const unsigned short* data, unsigned char* out, size_t len);
 
+// 取某个符号的码串（'0'/'1'）。没出现过的符号返回空串。
+const char* HuFF_Code(unsigned short sym);
+
 // 把树的形状写成「结构串」：前序遍历，内部节点写 '1'，叶子写 '0'。
 //
 // 同一趟遍历里，按「叶子被访问到的顺序」把每个叶子的字节收集进 symbols。
@@ -50,6 +53,9 @@ void HuFF_Struct(char* struct_out, int capacity, unsigned short* symbols);
 // 沿树走 bit_str 里的 '0'/'1'：'0' 走左、'1' 走右，
 // 每走到一个叶子就吐出一个字节，一共吐 len 个。
 void HuFF_Decode(const unsigned char* bit_str, unsigned short* out, size_t len);
+
+// 从位串里解出一个符号，游标推进它用掉的位数。
+unsigned short HuFF_Decode_One(const unsigned char* bit_str, size_t* pos);
 
 // 从「结构串 + 符号表」把树重建出来。
 // 建完之后 forest[0] 是根、count = 1，后面的 Code_Table / Decode 可以直接用。
