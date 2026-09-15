@@ -7,16 +7,29 @@
 //
 // .chao 文件的布局（按写入顺序）：
 //
-//   [data_len     : 4]   原文件字节数
-//   [leaf_count   : 4]   哈夫曼叶子数
-//   [struct_bytes : 4]   结构串压完占几个字节
-//   [dist_bytes   : 4]   距离段占几个字节
-//   [sym_n        : 4]   符号流有多少个符号
-//   [dist_n       : 4]   距离流有多少个距离
-//   [结构串       : struct_bytes]   前序遍历，内部 '1'、叶子 '0'，按位打包
-//   [符号表       : leaf_count * 2] 每个叶子一个 unsigned short，按叶子前序遍历顺序
-//   [距离段       : dist_bytes]     每条 5 位档位号 + 若干 extra，按位打包
-//   [载荷         : 到文件尾]       符号流的哈夫曼码流，末字节补 0 对齐
+//   [data_len       : 4]   原文件字节数
+//   [leaf_count     : 4]   符号树叶子数
+//   [struct_bytes   : 4]   符号树结构串占几个字节
+//   [dist_bytes     : 4]   距离段占几个字节
+//   [sym_n          : 4]   符号流有多少个符号
+//   [dist_n         : 4]   距离流有多少个距离
+//   [d_leaf_count   : 4]   档位树叶子数
+//   [d_struct_bytes : 4]   档位树结构串占几个字节
+//
+//   [结构串         : struct_bytes]      符号树的形状，按位打包
+//   [符号表         : leaf_count * 2]    每个叶子一个 unsigned short
+//   [档位结构串     : d_struct_bytes]    档位树的形状，按位打包
+//   [档位表         : d_leaf_count * 2]  每个档位号一个 unsigned short
+//   [距离段         : dist_bytes]        每条 = 档位码 + extra，按位打包
+//   [载荷           : 到文件尾]          符号流的哈夫曼码流，末字节补 0 对齐
+//
+// 两棵树各写各的表：
+//   符号树 —— 给载荷用，叶子是「字面量 0~255」或者「匹配 257~512」
+//   档位树 —— 给距离段用，叶子是距离的档位号 0~29
+// 档位号只说明「落在哪一档」，还得再接一段 extra 才能还原出精确距离，见 d_base / d_extra。
+//
+// 「结构串 + 符号表」是同一趟前序遍历里一起产出的：结构串记形状（内部节点 '1'、
+// 叶子 '0'），符号表按叶子被访问到的顺序记它代表谁。两边顺序天然对齐。
 //
 // 载荷放最后，是为了它的长度能直接用 EOF - 当前位置 算出来，省掉一个长度字段。
 
@@ -128,9 +141,17 @@ int compress(const char* out_name,
     HuFF_Get(sym, bit_str, (size_t)sym_n);
     bit_to_byte(bit_str, payload, (size_t)total_bits);
 
-    HuFF_Destroy();
+    HuFF_Destroy(); // 符号树退休，把全局那份树让给档位树
 
-    // --- todo ---
+    // ---- 第二棵树：档位树 ----
+    // 距离不能直接拿去建树：取值范围上万，树会摊成一大片浅叶子，还不如定长。
+    // 所以先把每条距离压成「档位号 + extra」：
+    //   档位号 = 距离落在 d_base 的哪一档，交给哈夫曼编码
+    //   extra  = 距离 - d_base[档位号]，定长 d_extra[档位号] 位，原样跟在后头
+    // 近的距离落在低档，档位号常见、extra 又短，收益就是这么来的。
+    //
+    // huffman_algo 的 forest 是全局单例，同一时间只能存在一棵树，
+    // 所以这里必须先 Destroy 上面那棵。
     unsigned int d_freq[ALPHABET_SIZE] = {0};
     for (int i = 0; i < dist_n; i++) d_freq[dist_code(dist[i])]++;
     if (HuFF_Init(d_freq, (size_t)dist_n) != 0) {
@@ -149,15 +170,17 @@ int compress(const char* out_name,
         if (d_freq[i] > 0) d_leaf_count++;
     }
     int d_struct_bytes = bit_to_byte((unsigned char*)d_struct_str, d_struct_packed, (size_t)(2 * d_leaf_count - 1));
-    // -----------
+
     FILE* fp = fopen(out_name, "wb");
     if (!fp) {
         free(bit_str);
         free(payload);
         return -1;
     }
-    // ---- 距离段：每条写 5 位档位号，后面跟若干位 extra ----
-    // 宽度随档位变（近的距离 extra 短），所以先算总位数，才知道位串开多大。
+
+    // ---- 距离段：档位码 + extra 交织 ----
+    // 每条宽度都不一样（档位码变长、extra 随档位变），所以先空跑一遍算总位数，
+    // 才知道位串要开多大。
     size_t dist_bit_count = 0;
     for (int i = 0; i < dist_n; i++) {
         int k = dist_code(dist[i]);
@@ -171,6 +194,7 @@ int compress(const char* out_name,
         fclose(fp);
         return -1;
     }
+    // 第二遍才真正拼位串：每条先写档位号的哈夫曼码，再写 extra 的若干低位
     size_t pos = 0;
     for (int i = 0; i < dist_n; i++) {
         int k = dist_code(dist[i]);
@@ -178,7 +202,7 @@ int compress(const char* out_name,
         for (int j = 0; code[j]; j++) dist_bit_str[pos++] = (unsigned char)code[j];
         put_bits(dist_bit_str, &pos, dist[i] - d_base[k], d_extra[k]);
     }
-    HuFF_Destroy();
+    HuFF_Destroy(); // 档位树也用完了，两棵树自始至终没同时活着
 
     size_t dist_bytes = (dist_bit_count + 7) / 8;
     unsigned char* dist_packed = malloc(1 + dist_bytes);
@@ -190,6 +214,9 @@ int compress(const char* out_name,
         return -1;
     }
     int dist_packed_count = bit_to_byte((unsigned char*)dist_bit_str, dist_packed, dist_bit_count);
+
+    // ---- 落盘：8 个长度字段打头，后面按顺序接 6 段数据 ----
+    // 顺序必须跟文件头那张表一模一样，读端是照着顺序硬读的。
     fwrite(&data_len, sizeof(int), 1, fp);
     fwrite(&leaf_count, sizeof(int), 1, fp);
     fwrite(&struct_bytes, sizeof(int), 1, fp);
@@ -199,6 +226,7 @@ int compress(const char* out_name,
     fwrite(&d_leaf_count, sizeof(int), 1, fp);
     fwrite(&d_struct_bytes, sizeof(int), 1, fp);
 
+    // 符号树的表 -> 档位树的表 -> 距离段 -> 载荷
     fwrite(struct_packed, 1, (size_t)struct_bytes, fp);
     fwrite(symbols, 1, sizeof(unsigned short) * leaf_count, fp);
     fwrite(d_struct_packed, 1, (size_t)d_struct_bytes, fp);
@@ -218,6 +246,15 @@ int compress(const char* out_name,
 }
 
 // 把 .chao 文件还原成原文件。成功返回 0。
+//
+// 解压比压缩绕，绕在两件事撞到一起：
+//   1. forest 是全局单例，符号树和档位树不能同时活着；
+//   2. 文件里是按「表的顺序」排的 —— 符号表在档位表前面，
+//      但使用顺序是反的（得先解出距离流，才能拼回原文）。
+// 所以不边读边解，分两步走：
+//   第一步：6 段数据全部读进各自的内存缓冲，一棵树都不建；
+//   第二步：按使用顺序轮流建树 —— 先档位树解距离段，用完销毁；
+//           再符号树解载荷，用完销毁。
 int decompress(const char* in_name, const char* out_name) {
     FILE* fp = fopen(in_name, "rb");
     if (!fp) return -1;
@@ -235,10 +272,16 @@ int decompress(const char* in_name, const char* out_name) {
         return -1;
     }
 
+    // ---- 第一步：按写入顺序，把 6 段数据全读进内存缓冲 ----
+    // 这一步只搬字节，一棵树都不建。
     int struct_bits = 2 * leaf_count - 1; // 结构串有多少位
 
+    // 两棵树的表各占一套，别复用：符号树的形状后面还要用一次
     unsigned char struct_packed[MAX_STRUCT_BYTES] = {0};
     char struct_str[MAX_STRUCT_STR];
+    unsigned char d_struct_packed[MAX_STRUCT_BYTES];
+    char d_struct_str[MAX_STRUCT_STR];
+    unsigned short d_symbols[ALPHABET_SIZE];
     for (int i = 0; i < struct_bytes; i++) {
         if (fread(&struct_packed[i], 1, 1, fp) != 1) {
             fclose(fp);
@@ -252,12 +295,21 @@ int decompress(const char* in_name, const char* out_name) {
         return -1;
     }
 
+    // 摊回位串，好让 rebuild 一位一位照着走
     byte_to_bit(struct_packed, (unsigned char*)struct_str, struct_bits);
 
-    if (HuFF_Rebuild((unsigned char*)struct_str, symbols) != 0) {
+    // 档位树的表，紧跟在符号树的表后面
+    if (fread(d_struct_packed, 1, (size_t)d_struct_bytes, fp) != (size_t)d_struct_bytes) {
         fclose(fp);
         return -1;
     }
+    byte_to_bit(d_struct_packed, (unsigned char*)d_struct_str, 2 * d_leaf_count - 1);
+
+    if (fread(d_symbols, sizeof(unsigned short), (size_t)d_leaf_count, fp) != (size_t)d_leaf_count) {
+        fclose(fp);
+        return -1;
+    }
+
     unsigned char* dist_bit_str = malloc((size_t)dist_bytes * 8 + 1);
     if (!dist_bit_str) {
         fclose(fp);
@@ -286,13 +338,21 @@ int decompress(const char* in_name, const char* out_name) {
         fclose(fp);
         return -1;
     }
+
+    // ---- 第二步之一：先建档位树，把距离段解回距离数组 ----
+    // 每条距离 = 档位号（走哈夫曼码，走到叶子为止）+ extra（定长，直接读几位）
+    if (HuFF_Rebuild((unsigned char*)d_struct_str, d_symbols) != 0) {
+        fclose(fp);
+        return -1;
+    }
     size_t pos = 0;
     for (int i = 0; i < dist_n; i++) {
-        int k = get_bits(dist_bit_str, &pos, 5);
+        unsigned short k = HuFF_Decode_One(dist_bit_str, &pos);
         dist[i] = d_base[k] + get_bits(dist_bit_str, &pos, d_extra[k]);
     }
-    // 4. 载荷 = 文件剩下的全部字节。
-    //    载荷是文件的最后一段，所以直接拿 EOF 兜底，不必再存一个长度字段。
+
+    // ---- 载荷 = 文件剩下的全部字节 ----
+    // 载荷是文件的最后一段，所以直接拿 EOF 兜底，不必再存一个长度字段。
     long payload_start = ftell(fp);
     fseek(fp, 0, SEEK_END);
     long payload_bytes = ftell(fp) - payload_start;
@@ -321,10 +381,20 @@ int decompress(const char* in_name, const char* out_name) {
     }
     fclose(fp);
 
-    // 5. 摊成位串再解码。
-    //    载荷最后一个字节的低位可能带着补的 0，但 HuFF_Decode 只要凑够
-    //    data_len 个字符就停，那些补出来的位不会被碰到。
+    // ---- 第二步之二：换回符号树，解载荷 ----
+    // 载荷最后一个字节的低位可能带着补的 0，但 HuFF_Decode 只要凑够
+    // sym_n 个符号就停，那些补出来的位不会被碰到。
     byte_to_bit(payload, bit_str, (int)payload_bytes * 8);
+    if (HuFF_Rebuild((unsigned char*)struct_str, symbols) != 0) {
+        free(payload);
+        free(bit_str);
+        free(out_buf);
+        free(final);
+        free(dist);
+        free(dist_packed);
+        free(dist_bit_str);
+        return -1;
+    }
     HuFF_Decode(bit_str, out_buf, (size_t)sym_n);
     HuFF_Destroy();
 
