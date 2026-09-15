@@ -1,4 +1,4 @@
-# comp-c
+# Comp-Chao
 
 一个用 C 从零写的无损压缩工具：**LZ77 + 哈夫曼**。
 
@@ -78,12 +78,12 @@ comp-c -c demo.txt out.chao  # 显式指定输出名，允许覆盖
 [dist_n         : 4]               距离流有多少个距离
 [d_leaf_count   : 4]               档位树叶子数 = 距离流用到几种档位
 [d_struct_bytes : 4]               档位树结构串压完占几个字节
-[符号树结构串   : struct_bytes]    前序遍历，内部节点 '1'、叶子 '0'，按位打包
-[符号表         : leaf_count x 2]  每个叶子一个 unsigned short，按叶子前序遍历顺序
-[档位树结构串   : d_struct_bytes]  编码方式同上
+[符号树结构串   : struct_bytes]     前序遍历，内部节点 '1'、叶子 '0'，按位打包
+[符号表         : leaf_count x 2]   每个叶子一个 unsigned short，按叶子前序遍历顺序
+[档位树结构串   : d_struct_bytes]   编码方式同上
 [档位表         : d_leaf_count x 2] 每个叶子一个 unsigned short
 [距离段         : dist_bytes]      每条「档位哈夫曼码 + extra 位」，按位打包
-[载荷           : 到文件尾]        符号流的哈夫曼码流，末字节补 0 对齐
+[载荷           : 到文件尾]         符号流的哈夫曼码流，末字节补 0 对齐
 ```
 
 没有匹配的文件（`dist_n = 0`）不产生档位树：`d_leaf_count`、`d_struct_bytes`、`dist_bytes` 三处都是 0，对应那两段的长度自然是 0。
