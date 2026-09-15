@@ -3,11 +3,16 @@
 #include <stdlib.h>
 #include <string.h>
 
+#define HASH_BITS 15
+#define HASH_SIZE (1 << HASH_BITS) // 32768，跟窗口一样大
+#define MIN_MATCH 3
+
 // 在 [pos - window, pos) 这段区间里，找一条和 buf[pos...] 开头最像的串。
 // 命中就把距离写进 *out_dist 并返回匹配长度；没命中返回 0。
 //
 // 找法是最朴素的：窗口里每个起点都试一遍，从头逐字节往下比，留最长的那条。
 // 复杂度 O(窗口长度 x 匹配长度)，大文件上会慢 —— 换成哈希链是后面的活。
+// 当教材 不在使用
 int find_match(const unsigned char* buf, long buf_len, int pos, int window, int* out_dist) {
     int start = pos - window < 0 ? 0 : (pos - window);
     int best_len = 0;
@@ -24,16 +29,61 @@ int find_match(const unsigned char* buf, long buf_len, int pos, int window, int*
     return best_len;
 }
 
+static int hash_3(const unsigned char* buf) {
+    return (buf[0] + buf[1] + buf[2]) & (HASH_SIZE - 1);
+}
+
+static int chain_find(const unsigned char* buf, long buf_len, int pos, int window,
+                      const int* head, const int* prev, int* out_dist) {
+    int best_len = 0, best_dist = 0;
+    if (pos + MIN_MATCH > buf_len) {
+        *out_dist = 0;
+        return 0;
+    }
+    int i = head[hash_3(buf + pos)];
+    while (i >= 0 && i >= pos - window) {
+        int len = 0;
+        while (len < MAX_MATCH && pos + len < buf_len && buf[i + len] == buf[pos + len]) len++;
+        if (len > best_len) {
+            best_len = len;
+            best_dist = pos - i;
+        }
+        i = prev[i];
+    }
+    *out_dist = best_dist;
+    return best_len;
+}
+
+static void chain_insert_upto(const unsigned char* buf, long buf_len, int target,
+                              int* head, int* prev, int* inserted) {
+    while (*inserted < target && *inserted + MIN_MATCH <= buf_len) {
+        int p = (*inserted)++;
+        int h = hash_3(buf + p);
+        prev[p] = head[h];
+        head[h] = p;
+    }
+}
+
 // 把原文扫成 (符号流, 距离流)。返回 0 成功。
 // 符号流里：字面量直接写字节值；匹配写 257 + 长度 - 3，距离另存进 dist。
 // 两条流是配对的 —— 符号流里每出现一个 >= 257 的值，dist 里就有一个距离对应它。
 int lz77_encode(const unsigned char* data, long data_len, unsigned short* sym,
                 unsigned short* dist, int* out_sym_n, int* out_dist_n) {
-
+    int* head = malloc(HASH_SIZE * sizeof(int));
+    int* prev = malloc(data_len * sizeof(int));
+    if (!head || !prev) {
+        free(head);
+        free(prev);
+        return -1;
+    }
+    memset(head, 0xFF, HASH_SIZE * sizeof(int));
+    int inserted = 0;
     int pos = 0, mlen = 0, num = 0, n_s = 0, n_d = 0;
     while (pos < data_len) {
         // 窗口 32767 = 2^15 - 1，跟 Deflate 取齐
-        mlen = find_match(data, data_len, pos, 32767, &num);
+        chain_insert_upto(data, data_len, pos, head, prev, &inserted);   // 先把历史挂上
+        mlen = chain_find(data, data_len, pos, 32767, head, prev, &num); // 再从链里找
+        // mlen = find_match(data, data_len, pos, 32767, &num);
         // 最短匹配取 3：再短的匹配，光「长度符号 + 距离」的代价就盖过直接存字面量了。
         // 这个阈值跟距离的编码代价挂钩，等距离压得更便宜之后要重算。
         if (mlen >= 3) {
@@ -47,6 +97,8 @@ int lz77_encode(const unsigned char* data, long data_len, unsigned short* sym,
     }
     *out_sym_n = n_s;
     *out_dist_n = n_d;
+    free(head);
+    free(prev);
     return 0;
 }
 

@@ -152,59 +152,65 @@ int compress(const char* out_name,
     //
     // huffman_algo 的 forest 是全局单例，同一时间只能存在一棵树，
     // 所以这里必须先 Destroy 上面那棵。
-    unsigned int d_freq[ALPHABET_SIZE] = {0};
-    for (int i = 0; i < dist_n; i++) d_freq[dist_code(dist[i])]++;
-    if (HuFF_Init(d_freq, (size_t)dist_n) != 0) {
-        free(bit_str);
-        free(payload);
-        return -1;
-    }
-    HuFF_Build();
-    HuFF_Code_Table();
+    size_t dist_bit_count = 0;
+    int d_leaf_count = 0;
+    int d_struct_bytes = 0;
+    size_t dist_bytes;
     char d_struct_str[MAX_STRUCT_STR];
     unsigned short d_symbols[ALPHABET_SIZE];
     unsigned char d_struct_packed[MAX_STRUCT_BYTES];
-    HuFF_Struct(d_struct_str, MAX_STRUCT_STR, d_symbols);
-    int d_leaf_count = 0;
-    for (size_t i = 0; i < ALPHABET_SIZE; i++) {
-        if (d_freq[i] > 0) d_leaf_count++;
-    }
-    int d_struct_bytes = bit_to_byte((unsigned char*)d_struct_str, d_struct_packed, (size_t)(2 * d_leaf_count - 1));
-
     FILE* fp = fopen(out_name, "wb");
     if (!fp) {
         free(bit_str);
         free(payload);
         return -1;
     }
+    unsigned char* dist_bit_str = NULL;
+    if (dist_n > 0) {
+        unsigned int d_freq[ALPHABET_SIZE] = {0};
+        for (int i = 0; i < dist_n; i++) d_freq[dist_code(dist[i])]++;
+        if (HuFF_Init(d_freq, (size_t)dist_n) != 0) {
+            free(bit_str);
+            free(payload);
+            return -1;
+        }
+        HuFF_Build();
+        HuFF_Code_Table();
+        HuFF_Struct(d_struct_str, MAX_STRUCT_STR, d_symbols);
+        for (size_t i = 0; i < ALPHABET_SIZE; i++) {
+            if (d_freq[i] > 0) d_leaf_count++;
+        }
+        d_struct_bytes = bit_to_byte((unsigned char*)d_struct_str, d_struct_packed, (size_t)(2 * d_leaf_count - 1));
 
-    // ---- 距离段：档位码 + extra 交织 ----
-    // 每条宽度都不一样（档位码变长、extra 随档位变），所以先空跑一遍算总位数，
-    // 才知道位串要开多大。
-    size_t dist_bit_count = 0;
-    for (int i = 0; i < dist_n; i++) {
-        int k = dist_code(dist[i]);
-        dist_bit_count += strlen(HuFF_Code(k)) + d_extra[k];
+        // ---- 距离段：档位码 + extra 交织 ----
+        // 每条宽度都不一样（档位码变长、extra 随档位变），所以先空跑一遍算总位数，
+        // 才知道位串要开多大。
+        for (int i = 0; i < dist_n; i++) {
+            int k = dist_code(dist[i]);
+            dist_bit_count += strlen(HuFF_Code(k)) + d_extra[k];
+        }
+        dist_bit_str = malloc(dist_bit_count + 1);
+        if (!dist_bit_str) {
+            free(bit_str);
+            free(payload);
+            fclose(fp);
+            return -1;
+        }
+        // 第二遍才真正拼位串：每条先写档位号的哈夫曼码，再写 extra 的若干低位
+        size_t pos = 0;
+        for (int i = 0; i < dist_n; i++) {
+            int k = dist_code(dist[i]);
+            const char* code = HuFF_Code(k);
+            for (int j = 0; code[j]; j++) dist_bit_str[pos++] = (unsigned char)code[j];
+            put_bits(dist_bit_str, &pos, dist[i] - d_base[k], d_extra[k]);
+        }
+        HuFF_Destroy(); // 档位树也用完了，两棵树自始至终没同时活着
+        dist_bytes = (dist_bit_count + 7) / 8;
+    } else {
+        d_leaf_count = 0;
+        d_struct_bytes = 0;
+        dist_bytes = 0;
     }
-
-    unsigned char* dist_bit_str = malloc(dist_bit_count + 1);
-    if (!dist_bit_str) {
-        free(bit_str);
-        free(payload);
-        fclose(fp);
-        return -1;
-    }
-    // 第二遍才真正拼位串：每条先写档位号的哈夫曼码，再写 extra 的若干低位
-    size_t pos = 0;
-    for (int i = 0; i < dist_n; i++) {
-        int k = dist_code(dist[i]);
-        const char* code = HuFF_Code(k);
-        for (int j = 0; code[j]; j++) dist_bit_str[pos++] = (unsigned char)code[j];
-        put_bits(dist_bit_str, &pos, dist[i] - d_base[k], d_extra[k]);
-    }
-    HuFF_Destroy(); // 档位树也用完了，两棵树自始至终没同时活着
-
-    size_t dist_bytes = (dist_bit_count + 7) / 8;
     unsigned char* dist_packed = malloc(1 + dist_bytes);
     if (!dist_packed) {
         free(bit_str);
@@ -272,16 +278,20 @@ int decompress(const char* in_name, const char* out_name) {
         return -1;
     }
 
-    // ---- 第一步：按写入顺序，把 6 段数据全读进内存缓冲 ----
-    // 这一步只搬字节，一棵树都不建。
-    int struct_bits = 2 * leaf_count - 1; // 结构串有多少位
-
     // 两棵树的表各占一套，别复用：符号树的形状后面还要用一次
     unsigned char struct_packed[MAX_STRUCT_BYTES] = {0};
     char struct_str[MAX_STRUCT_STR];
     unsigned char d_struct_packed[MAX_STRUCT_BYTES];
     char d_struct_str[MAX_STRUCT_STR];
     unsigned short d_symbols[ALPHABET_SIZE];
+    unsigned short symbols[ALPHABET_SIZE] = {0};
+    unsigned char* dist_packed = NULL;
+    unsigned char* dist_bit_str = NULL;
+    unsigned short* dist = NULL;
+
+    // ---- 第一步：按写入顺序，把 6 段数据全读进内存缓冲 ----
+    // 这一步只搬字节，一棵树都不建。
+    int struct_bits = 2 * leaf_count - 1; // 结构串有多少位
     for (int i = 0; i < struct_bytes; i++) {
         if (fread(&struct_packed[i], 1, 1, fp) != 1) {
             fclose(fp);
@@ -289,7 +299,6 @@ int decompress(const char* in_name, const char* out_name) {
         }
     }
 
-    unsigned short symbols[ALPHABET_SIZE] = {0};
     if (fread(symbols, sizeof(unsigned short), (size_t)leaf_count, fp) != (size_t)leaf_count) {
         fclose(fp);
         return -1;
@@ -297,60 +306,62 @@ int decompress(const char* in_name, const char* out_name) {
 
     // 摊回位串，好让 rebuild 一位一位照着走
     byte_to_bit(struct_packed, (unsigned char*)struct_str, struct_bits);
+    if (dist_n > 0) {
 
-    // 档位树的表，紧跟在符号树的表后面
-    if (fread(d_struct_packed, 1, (size_t)d_struct_bytes, fp) != (size_t)d_struct_bytes) {
-        fclose(fp);
-        return -1;
-    }
-    byte_to_bit(d_struct_packed, (unsigned char*)d_struct_str, 2 * d_leaf_count - 1);
+        // 档位树的表，紧跟在符号树的表后面
+        if (fread(d_struct_packed, 1, (size_t)d_struct_bytes, fp) != (size_t)d_struct_bytes) {
+            fclose(fp);
+            return -1;
+        }
+        byte_to_bit(d_struct_packed, (unsigned char*)d_struct_str, 2 * d_leaf_count - 1);
 
-    if (fread(d_symbols, sizeof(unsigned short), (size_t)d_leaf_count, fp) != (size_t)d_leaf_count) {
-        fclose(fp);
-        return -1;
-    }
+        if (fread(d_symbols, sizeof(unsigned short), (size_t)d_leaf_count, fp) != (size_t)d_leaf_count) {
+            fclose(fp);
+            return -1;
+        }
 
-    unsigned char* dist_bit_str = malloc((size_t)dist_bytes * 8 + 1);
-    if (!dist_bit_str) {
-        fclose(fp);
-        return -1;
-    }
-    unsigned char* dist_packed = malloc(dist_bytes + 1);
-    if (!dist_packed) {
-        free(dist_bit_str);
-        fclose(fp);
-        return -1;
-    }
-    if (fread(dist_packed, 1, (size_t)dist_bytes, fp) != (size_t)dist_bytes) {
-        HuFF_Destroy();
-        free(dist_bit_str);
-        free(dist_packed);
-        fclose(fp);
-        return -1;
-    }
-    byte_to_bit(dist_packed, dist_bit_str, (int)((size_t)dist_bytes * 8));
+        dist_bit_str = malloc((size_t)dist_bytes * 8 + 1);
+        if (!dist_bit_str) {
+            fclose(fp);
+            return -1;
+        }
+        dist_packed = malloc(dist_bytes + 1);
+        if (!dist_packed) {
+            free(dist_bit_str);
+            fclose(fp);
+            return -1;
+        }
+        if (fread(dist_packed, 1, (size_t)dist_bytes, fp) != (size_t)dist_bytes) {
+            HuFF_Destroy();
+            free(dist_bit_str);
+            free(dist_packed);
+            fclose(fp);
+            return -1;
+        }
+        byte_to_bit(dist_packed, dist_bit_str, (int)((size_t)dist_bytes * 8));
+        size_t size = dist_n * sizeof(unsigned short);
+        if (size == 0) size = 1;
+        dist = malloc(size);
+        if (!dist) {
+            HuFF_Destroy();
+            free(dist_bit_str);
+            free(dist_packed);
+            fclose(fp);
+            return -1;
+        }
 
-    unsigned short* dist = malloc(dist_n * sizeof(unsigned short));
-    if (!dist) {
-        HuFF_Destroy();
-        free(dist_bit_str);
-        free(dist_packed);
-        fclose(fp);
-        return -1;
+        // ---- 第二步之一：先建档位树，把距离段解回距离数组 ----
+        // 每条距离 = 档位号（走哈夫曼码，走到叶子为止）+ extra（定长，直接读几位）
+        if (HuFF_Rebuild((unsigned char*)d_struct_str, d_symbols) != 0) {
+            fclose(fp);
+            return -1;
+        }
+        size_t pos = 0;
+        for (int i = 0; i < dist_n; i++) {
+            unsigned short k = HuFF_Decode_One(dist_bit_str, &pos);
+            dist[i] = d_base[k] + get_bits(dist_bit_str, &pos, d_extra[k]);
+        }
     }
-
-    // ---- 第二步之一：先建档位树，把距离段解回距离数组 ----
-    // 每条距离 = 档位号（走哈夫曼码，走到叶子为止）+ extra（定长，直接读几位）
-    if (HuFF_Rebuild((unsigned char*)d_struct_str, d_symbols) != 0) {
-        fclose(fp);
-        return -1;
-    }
-    size_t pos = 0;
-    for (int i = 0; i < dist_n; i++) {
-        unsigned short k = HuFF_Decode_One(dist_bit_str, &pos);
-        dist[i] = d_base[k] + get_bits(dist_bit_str, &pos, d_extra[k]);
-    }
-
     // ---- 载荷 = 文件剩下的全部字节 ----
     // 载荷是文件的最后一段，所以直接拿 EOF 兜底，不必再存一个长度字段。
     long payload_start = ftell(fp);
@@ -493,21 +504,30 @@ static void pick_output_name(const char* wanted, unsigned int hash, char* out, s
     }
 }
 
+static void print_usage(const char* prog) {
+    printf("usage:\n");
+    printf("  %s -v                    show version\n", prog);
+    printf("  %s -c <input> [output]   compress;   default output: <input>.chao\n", prog);
+    printf("  %s -d <input> [output]   decompress; default output: <input>.txt\n", prog);
+}
+
 // ==================== 入口 ====================
 // 用法：
-//   huffman c <原文> [压缩包]      省略输出名 -> 把扩展名换成 .chao
-//   huffman d <压缩包> [还原文件]   省略输出名 -> 把扩展名换成 .txt，撞名就插一段短 hash
+//   comp-c -c <原文> [压缩包]      省略输出名 -> 把扩展名换成 .chao
+//   comp-c -d <压缩包> [还原文件]   省略输出名 -> 把扩展名换成 .txt，撞名就插一段短 hash
 int main(int argc, char* argv[]) {
+    if (argc == 2 && (strcmp(argv[1], "-v") == 0 || strcmp(argv[1], "--version") == 0)) {
+        printf("comp-c version 1.1.0\n");
+        return 0;
+    }
     if (argc < 3) {
-        printf("usage:\n");
-        printf("  %s c <input> [output]    compress;   default output: <input>.chao\n", argv[0]);
-        printf("  %s d <input> [output]    decompress; default output: <input>.txt\n", argv[0]);
+        print_usage(argv[0]);
         return 1;
     }
 
     char out_name[1024];
 
-    if (argv[1][0] == 'c') {
+    if (strcmp(argv[1], "-c") == 0) {
         // 输出名：给了就用给的，没给就把原文的扩展名换成 .chao
         if (argc >= 4) {
             snprintf(out_name, sizeof(out_name), "%s", argv[3]);
@@ -552,7 +572,7 @@ int main(int argc, char* argv[]) {
         free(dist);
         free(raw);
 
-    } else if (argv[1][0] == 'd') {
+    } else if (strcmp(argv[1], "-d") == 0) {
         // 输出名：给了就用给的（明确指定就照写，允许覆盖）；
         //         没给就把扩展名换成 .txt，如果已经存在就换个带短 hash 的名字。
         if (argc >= 4) {
